@@ -5,7 +5,7 @@ Multi-module CAMAC data acquisition system in Python via CC-USB. Reads Phillips 
 ## Features
 
 - **Multi-module readout** — simultaneous acquisition from Phillips 7164 ADCs (gamma detectors, neutron wall) and Phillips 7186 TDC (timing) via a CC-USB CAMAC controller
-- **LAM polling** — optional Hit Register pre-check (F(6)A(1), ~50 µs) before full sparse read (~420 µs), dramatically reducing dead time at low-to-moderate count rates
+- **LAM polling** — optional Hit Register pre-check (F(6)A(1), ~50 µs) before full sparse read (~420 µs), dramatically reducing dead time at low-to-moderate count rates(TO-DO, sitill batteling) 
 - **Dead time monitoring** — real-time non-paralyzable (Gedcke-Hale) dead time correction with rolling τ estimate; color-coded display and CSV log output
 - **Live GUI** — Tkinter interface with per-channel histogram display for gamma detectors, neutron wall (4×4 grid), and TDC; log/linear scale toggle
 - **Structured NumPy output** — events saved as `.npy` files with fields: `event` (uint32), `time_s` (float64), `slot` (uint8), `channel` (uint8), `value` (uint16)
@@ -23,15 +23,6 @@ Multi-module CAMAC data acquisition system in Python via CC-USB. Reads Phillips 
 
 > The system runs on Windows due to the `libxxusb.dll` dependency.
 
-## Installation
-
-```bash
-git clone https://github.com/yourusername/camac-daq.git
-cd camac-daq
-pip install numpy
-```
-
-No additional dependencies beyond the Python standard library and NumPy.
 
 ## Configuration
 
@@ -44,12 +35,12 @@ ADC_NEUTRON = {"slot": 19, "channels": list(range(16)), ...}
 TDC_MAIN   = {"slot": 21, "channels": list(range(2)), ...}
 
 ENABLE_TDC      = True       # set False to skip TDC readout
-ENABLE_LAM_POLL = True       # enable Hit Register pre-check
+ENABLE_LAM_POLL = True       # enable Hit Register pre-check not working just now, i havent figure it out how
 LOWER_THRESHOLD = 50         # ADC/TDC lower threshold (raw ch)
 AUTO_SAVE_INTERVAL = 1000000 # events between auto-saves
 ```
 
-## Usage
+## Usage, the driver is 32 bit for some reason... use a 32bit python installation, i know, it a pain in the ass
 
 ```bash
 python daq.py
@@ -88,13 +79,10 @@ where $\dot{n}$ is the observed rate, $\tau$ is the mean readout cycle time (est
 
 ## Citation
 
-If you use this software in your research, please cite:
+If you use this software in your research, please cite the paper and the repo
 
-```
-[Paper citation — DOI to be added upon publication]
-```
+TBA
 
-Software archive: [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX)
 
 ## License
 
