@@ -82,7 +82,7 @@ where $\dot{n}$ is the observed rate, $\tau$ is the mean readout cycle time (est
 If you use this software in your research, please cite the paper and the repo
 
 TBA
-
+[![DOI](https://zenodo.org/badge/1188416195.svg)](https://doi.org/10.5281/zenodo.19157215)
 
 ## License
 
