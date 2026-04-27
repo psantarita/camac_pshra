@@ -44,12 +44,10 @@ Tested on standard IEEE 583 CAMAC crates (25-station full-size and LeCroy 8013A 
 
 | File | Description |
 |------|-------------|
-| `8list.py` | Main DAQ application — list-mode, multi-event, dual ADC + TDC, tkinter GUI |
-| `coincidence.ipynb` | Jupyter notebook for offline coincidence analysis with gating |
-| `restart.py` | Hardware rescue script — stops list mode, resets all registers, flushes USB FIFO |
+| `maindaq.py` | Main DAQ application — list-mode, multi-event, dual ADC + TDC, tkinter GUI |
+| `restart1.py` | Hardware rescue script — stops list mode, resets all registers, flushes USB FIFO |
 | `slot_scanner.py` | Scans all CAMAC slots and identifies modules by type |
 | `brute_scanner.py` | Aggressive scanner — tries N=1–30 with 6 CAMAC functions each |
-| `web_daq.py` | Flask + SocketIO web-based DAQ server (replaces tkinter for remote access) |
 
 ## Quick Start
 
