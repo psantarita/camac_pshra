@@ -47,13 +47,12 @@ Tested on standard IEEE 583 CAMAC crates (25-station full-size and LeCroy 8013A 
 | `maindaq.py` | Main DAQ application — list-mode, multi-event, dual ADC + TDC, tkinter GUI |
 | `restart1.py` | Hardware rescue script — stops list mode, resets all registers, flushes USB FIFO |
 | `slot_scanner.py` | Scans all CAMAC slots and identifies modules by type |
-| `brute_scanner.py` | Aggressive scanner — tries N=1–30 with 6 CAMAC functions each |
 
 ## Quick Start
 
 1. Install Python 3.11 (32-bit) and ensure `libxxusb.dll` is in `C:\Windows\SysWOW64\`
 2. Connect the CC-USB via USB, power on the crate
-3. Edit the configuration section at the top of `8list.py`:
+3. Edit the configuration section at the top of `maindaq.py`:
 
 ```python
 SERIAL      = b"CC0284"          # Your CC-USB serial number
@@ -63,7 +62,7 @@ TDC_MAIN    = {"slot": 21, ...}
 ENABLE_TDC  = True               # False if no TDC connected
 ```
 
-4. Run: `python 8list.py`
+4. Run: `python maindaq.py`
 5. Click **START** — the console shows live event rates, dead time, and buffer diagnostics
 6. Click **STOP** — saves all events to `run_YYYYMMDD_HHMMSS_final.npy`
 
