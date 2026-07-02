@@ -20,6 +20,18 @@ HARDWARE NOTES (Phillips 7164):
   - Quad groups {0-3},{4-7},{8-11},{12-15} share internal circuitry.
     Large signals couple weakly (~1%) across group boundaries.
     LOWER_THRESHOLD=100 eliminates these artefacts since pedestals sit at ~22.
+
+RUN ORGANISATION / STABILITY (added):
+  - Each START creates its own output folder named after the "Run name" box.
+    First run: <name>.  Subsequent runs: <name>_2, <name>_3, ... (never
+    overwrites). All .npy parts, the final save, deadtime_*.csv and a small
+    run_info.txt go inside that folder.
+  - "List mode (fast)" checkbox toggles between list mode and the slower,
+    more robust polled mode. Read at START, locked during a run.
+  - List mode now RECOVERS from USB error bursts instead of dying: it stops
+    the Action Register, drains the FIFO, and restarts acquisition. Only after
+    repeated failed recoveries does it stop — and then it does so cleanly
+    (saves the buffer, resets the crate) via the GUI thread.
 """
 
 import ctypes
@@ -29,6 +41,7 @@ import math
 import os
 import queue
 import signal
+import struct
 import sys
 import threading
 import time
@@ -39,25 +52,37 @@ from collections import deque
 DLL_PATH = r"C:\Windows\SysWOW64\libxxusb.dll"
 SERIAL = b"CC0284"
 
+
 # Channels 0-14 = front panel 1-15.
 # Channel 15 (front panel 16) omitted — not returned by sparse read on this module.
-ADC_GAMMA = {"slot": 17, "channels": list(range(16)), "name": "Gamma Detectors"}
-ADC_NEUTRON = {"slot": 19, "channels": list(range(16)), "name": "Neutron Wall"}
+ADC_GAMMA = {"slot": 19, "channels": list(range(16)), "name": "Gamma Detectors"}
+ADC_NEUTRON = {"slot": 17, "channels": list(range(16)), "name": "Neutron Wall"}
 TDC_MAIN = {"slot": 21, "channels": list(range(2)), "name": "Main Timing"}
 
 # FP_OFFSET: add to CAMAC address to get front panel channel number displayed in GUI
 FP_OFFSET = 1
 
-ENABLE_TDC = False
+ENABLE_TDC = True
 
 # List-mode: CC-USB executes stack autonomously on every LAM trigger.
 # Dead time drops from ~420 µs to ~4 µs (pure CAMAC execution time).
 # NOTE: ch15 (front panel 16) is not available in list mode — the 7164
 # sparse read omits CAMAC A=15 and there is no slot in the autonomous
 # stack for a direct read. Use polled mode if ch15 is needed.
+#
+# This is now the DEFAULT only — it is overridden at START by the GUI
+# "List mode (fast)" checkbox (unchecked = polled).
 ENABLE_LIST_MODE = True
 LIST_MODE_BUF_BYTES = 65536  # 64 kB — room for multi-event buffers
 LIST_MODE_TIMEOUT_MS = 500  # longer timeout to collect full buffers
+
+# ---- Long-run stability: USB error recovery (list mode) ----
+USB_ERROR_LIMIT = 10  # consecutive bulk_read errors before attempting recovery
+MAX_RECOVERIES = 5  # give up (clean stop) after this many recoveries in a row
+GOOD_READS_TO_FORGIVE = 1000  # successful reads after which recovery counter resets
+
+# ---- Run / folder organisation ----
+DEFAULT_RUN_NAME = "run"  # base folder name; each START makes <name>, <name>_2, ...
 
 # Polon 420A scaler — slot 22, channel 0 = gate pulse (real events produced).
 # Counts freely after F(9) clear, no enable needed.
@@ -73,9 +98,9 @@ LOWER_THRESHOLD = 100
 UPPER_THRESHOLD_ADC = 4080
 UPPER_THRESHOLD_TDC = 4080
 
-NBINS = 512
+NBINS = 4096
 VMIN = 0
-VMAX = 4095
+VMAX = 4096
 
 X_TICKS = [0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096]
 
@@ -95,6 +120,9 @@ hdev = None
 running = False
 acquisition_thread = None
 event_queue = queue.Queue(maxsize=500000)
+
+# Current run output folder (set on START). All files for the run land here.
+run_folder = None
 
 gamma_data = [deque(maxlen=1000000) for _ in range(16)]
 neutron_data = [deque(maxlen=1000000) for _ in range(16)]
@@ -135,6 +163,9 @@ toggle_display_btn = None
 clear_display_btn = None
 gamma_channel_selector = None
 tdc_channel_selector = None
+run_name_entry = None  # text box for the run/folder base name
+listmode_check = None  # checkbox: list mode vs polled
+listmode_var = None  # BooleanVar backing the checkbox
 current_gamma_channel = 4  # CAMAC A=4 = front panel ch5
 current_tdc_channel = 0
 
@@ -145,6 +176,62 @@ tdc_canvas_height = 300
 neutron_grid_size = 4
 neutron_cell_width = 200
 neutron_cell_height = 150
+
+
+# ==================== RUN FOLDER HELPERS ====================
+
+
+def make_run_folder(base_name):
+    """Create (and return) a fresh output folder for this run.
+
+    The first run with a given name uses the name as-is; subsequent runs get a
+    numeric suffix so nothing is ever overwritten:
+        cobalt, cobalt_2, cobalt_3, ...
+    """
+    base = (base_name or "").strip()
+    # keep it filesystem-safe
+    base = "".join(c for c in base if c.isalnum() or c in ("_", "-", ".", " "))
+    base = base.strip().replace(" ", "_")
+    if not base:
+        base = DEFAULT_RUN_NAME
+    candidate = base
+    n = 1
+    while os.path.exists(candidate):
+        n += 1
+        candidate = f"{base}_{n}"
+    os.makedirs(candidate, exist_ok=True)
+    return candidate
+
+
+def write_run_info(folder):
+    """Drop a small human-readable summary of the run configuration into the
+    run folder. Purely informational — handy when reviewing old runs."""
+    try:
+        path = os.path.join(folder, "run_info.txt")
+        with open(path, "w") as f:
+            f.write("CAMAC DAQ run\n")
+            f.write(
+                f"start          : "
+                f"{datetime.datetime.now().isoformat(timespec='seconds')}\n"
+            )
+            f.write(f"mode           : {'LIST' if ENABLE_LIST_MODE else 'POLLED'}\n")
+            f.write(f"lower_threshold: {LOWER_THRESHOLD}\n")
+            f.write(
+                f"gamma slot     : {ADC_GAMMA['slot']} "
+                f"(CAMAC ch {ADC_GAMMA['channels']})\n"
+            )
+            f.write(
+                f"neutron slot   : {ADC_NEUTRON['slot']} "
+                f"(CAMAC ch {ADC_NEUTRON['channels']})\n"
+            )
+            if ENABLE_TDC:
+                f.write(f"tdc slot       : {TDC_MAIN['slot']}\n")
+            f.write(
+                "note           : channel field in .npy is CAMAC 0-based; "
+                "front panel = channel + 1\n"
+            )
+    except Exception as e:
+        print(f"[RUN-INFO] could not write: {e}")
 
 
 # ==================== HARDWARE ====================
@@ -242,9 +329,7 @@ def open_ccusb():
 
     # Stop any residual list-mode from a previous session before C/Z.
     # xxusb_stack_write returns -116 if Action Register is still set.
-    import struct as _struct
-
-    _pkt = _struct.pack("<3H", 5, 0, 0)  # Action Register = 0
+    _pkt = struct.pack("<3H", 5, 0, 0)  # Action Register = 0
     dll.xxusb_bulk_write(hdev, _pkt, len(_pkt), 500)
     _q = ctypes.c_int(0)
     _x = ctypes.c_int(0)
@@ -436,8 +521,6 @@ def listmode_init():
       Word 2: 0x8010                            — C=1 (max-count follows), QS=1
       Word 3: max repeat count (20, safe margin above 16 channels)
     """
-    import struct
-
     QS_OPT = 0x8010  # C=1 (continuation), QS bit 4 = 1
     QS_MAX = 20  # safety limit (> 16 ch + possible duplicate)
 
@@ -541,11 +624,59 @@ def listmode_init():
     print(f"  [OK]   List-mode STARTED (ret={ret})")
 
 
+def _usb_recover():
+    """Light recovery from a USB error burst in list mode.
+
+    The stack, LAM mask, Global Mode and buffer timeout all remain programmed
+    inside the CC-USB after a transient error, so we only need to:
+      1. stop autonomous acquisition (Action Register = 0),
+      2. drain whatever stale data is left in the USB FIFO,
+      3. restart autonomous acquisition (Action Register = 1).
+
+    Returns True if the restart write succeeded. Used by _run_listmode() to
+    survive transient USB stalls on long (multi-hour) runs instead of dying.
+    """
+    try:
+        # 1. Stop autonomous acquisition
+        dll.xxusb_bulk_write(hdev, struct.pack("<3H", 5, 0, 0), 6, 1000)
+        time.sleep(0.2)
+
+        # 2. Drain whatever is left in the USB FIFO
+        tmp = ctypes.create_string_buffer(LIST_MODE_BUF_BYTES)
+        for _ in range(100):
+            if dll.xxusb_bulk_read(hdev, tmp, LIST_MODE_BUF_BYTES, 100) <= 0:
+                break
+
+        # 3. Restart autonomous acquisition
+        ret = dll.xxusb_bulk_write(hdev, struct.pack("<3H", 5, 0, 1), 6, 1000)
+        time.sleep(0.1)
+        return ret >= 0
+    except Exception as e:
+        print(f"[RECOVER] exception: {e}")
+        return False
+
+
+def _request_clean_stop():
+    """Ask the GUI (main) thread to perform a full clean stop: flush the save
+    buffer and reset the hardware.
+
+    Tkinter is not thread-safe, so the acquisition thread must NOT call
+    on_stop() directly. We schedule it on the main loop instead. on_stop()
+    checks `running` (still True here) so it will do the full teardown.
+    """
+    global running
+    try:
+        if root is not None:
+            root.after(0, on_stop)
+        else:
+            running = False
+    except Exception:
+        running = False
+
+
 def listmode_stop():
     """Stop list-mode using the exact sequence that reliably resets the CC-USB.
     Derived from empirical testing — order matters."""
-    import struct
-
     try:
         # 1. Kill autonomous acquisition in FPGA
         # CRITICAL: [5, 0, 0] = register 0 (Action Register) = 0 (stop)
@@ -631,14 +762,12 @@ def listmode_parse_buffer(raw_bytes, n_bytes, event_time):
     7164 hardware peek quirk.  The 7186 TDC does not have this quirk but
     uses the same seen-set logic for safety.
     """
-    import struct as _struct
-
     events = []
     if n_bytes < 4:
         return events
 
     n_words = n_bytes // 2
-    words = list(_struct.unpack_from(f"<{n_words}H", bytes(raw_bytes[: n_words * 2])))
+    words = list(struct.unpack_from(f"<{n_words}H", bytes(raw_bytes[: n_words * 2])))
 
     # Debug: first 20 buffers
     if not hasattr(listmode_parse_buffer, "_dbg"):
@@ -974,6 +1103,15 @@ def _run_listmode():
     Multi-event mode: each bulk_read may return a buffer with many events.
     The CC-USB header word bits 12-14 encode buffer status:
       bit 12 = overflow (events were lost).
+
+    LONG-RUN STABILITY:
+      A burst of USB_ERROR_LIMIT consecutive bulk_read errors no longer kills
+      the run. Instead it triggers _usb_recover() (stop / drain FIFO / restart).
+      Only after MAX_RECOVERIES failed-or-repeated recoveries does it stop, and
+      it then does so CLEANLY via _request_clean_stop() so the save buffer is
+      flushed and the crate is reset. A long stable stretch
+      (GOOD_READS_TO_FORGIVE successful reads) resets the recovery counter so a
+      healthy multi-hour run is never killed by occasional transient bursts.
     """
     global running, read_cycles, poll_cycles, readout_times, measured_readout_time
 
@@ -981,6 +1119,8 @@ def _run_listmode():
     events_read = 0
     overflow_total = 0
     consecutive_errors = 0
+    recovery_attempts = 0
+    good_reads_since_recovery = 0
     last_report = time.time()
 
     while running:
@@ -994,19 +1134,39 @@ def _run_listmode():
         if n_bytes <= 0:
             poll_cycles += 1
             if n_bytes < -1:
-                # USB error (not just timeout)
+                # genuine USB error (not just an idle timeout)
                 consecutive_errors += 1
-                if consecutive_errors > 20:
+                if consecutive_errors >= USB_ERROR_LIMIT:
                     print(
-                        f"[THREAD] Too many USB errors ({consecutive_errors}), stopping"
+                        f"[THREAD] {consecutive_errors} consecutive USB errors "
+                        f"(last code {n_bytes}) — attempting recovery "
+                        f"{recovery_attempts + 1}/{MAX_RECOVERIES}..."
                     )
-                    running = False
-                    break
+                    if recovery_attempts < MAX_RECOVERIES and _usb_recover():
+                        recovery_attempts += 1
+                        consecutive_errors = 0
+                        good_reads_since_recovery = 0
+                        print("[THREAD] Recovery OK — acquisition resumed.")
+                    else:
+                        print(
+                            "[THREAD] Recovery failed or retry limit reached — "
+                            "stopping run cleanly and saving data."
+                        )
+                        _request_clean_stop()
+                        break
+                else:
+                    time.sleep(0.01)  # brief backoff; don't spin on errors
             else:
-                consecutive_errors = 0
+                consecutive_errors = 0  # plain timeout: no data is normal
             continue
 
+        # ---- successful read ----
         consecutive_errors = 0
+        good_reads_since_recovery += 1
+        if recovery_attempts > 0 and good_reads_since_recovery > GOOD_READS_TO_FORGIVE:
+            # long stable stretch — forgive earlier recoveries
+            recovery_attempts = 0
+
         raw = bytearray(buf.raw[:n_bytes])
 
         # Check overflow bit in header (bit 12)
@@ -1053,17 +1213,25 @@ def _run_listmode():
             dup_g = getattr(listmode_parse_buffer, "_dup_g", 0)
             dup_n = getattr(listmode_parse_buffer, "_dup_n", 0)
             ovf_str = f" | OVERFLOW={overflow_total}" if overflow_total else ""
+            rec_str = f" | recoveries={recovery_attempts}" if recovery_attempts else ""
             print(
                 f"[THREAD] {rate:.1f} ev/s | τ≈{LIST_MODE_TAU_S * 1e6:.0f}µs (Qstop) | DT≈{dt_pct:.2f}%"
                 f" | buf {n_bytes}B {n_evts}evt"
-                f" | dup_caught: g={dup_g} n={dup_n}{ovf_str}"
+                f" | dup_caught: g={dup_g} n={dup_n}{ovf_str}{rec_str}"
             )
             events_read = 0
             last_report = now
 
 
 def _run_polled():
-    """Original polled EASY-CAMAC loop with Hit Register gating."""
+    """Original polled EASY-CAMAC loop with Hit Register gating.
+
+    Slower than list mode but inherently robust: there is no autonomous FIFO
+    to overflow, every CAMAC read is per-call error-checked (returns [] on
+    failure), and a transient glitch simply costs one cycle. Use this mode
+    (uncheck "List mode (fast)") for long unattended runs where stability
+    matters more than maximum throughput.
+    """
     global running, read_cycles, poll_cycles, readout_times, measured_readout_time
 
     events_read = 0
@@ -1099,7 +1267,8 @@ def _run_polled():
 
 def save_numpy_format(filename, events):
     """
-    Save events as structured NumPy .npy file.
+    Save events as structured NumPy .npy file INSIDE the current run folder.
+    `filename` is a bare basename; the run folder is prepended automatically.
     channel field is CAMAC 0-based address. Front panel = channel + 1.
 
     Memory-optimised for 32-bit Python: pre-allocates the array and fills
@@ -1113,6 +1282,9 @@ def save_numpy_format(filename, events):
         if n_hits == 0:
             print(f"[SAVE] {filename} — no hits, skipped")
             return
+
+        # Route into the per-run folder (falls back to CWD if unset)
+        path = os.path.join(run_folder, filename) if run_folder else filename
 
         # Pre-allocate structured array (single allocation)
         dt = np.dtype(
@@ -1134,15 +1306,15 @@ def save_numpy_format(filename, events):
                 data[idx] = (enum, ts, hit["slot"], hit["channel"], hit["amplitude"])
                 idx += 1
 
-        np.save(filename, data)
-        print(f"[SAVE] {filename} ({len(events)} events, {n_hits} hits)")
+        np.save(path, data)
+        print(f"[SAVE] {path} ({len(events)} events, {n_hits} hits)")
     except ImportError:
         print("[WARN] NumPy not available")
     except MemoryError:
         print(
             f"[SAVE] MemoryError on {filename} — {n_hits} hits too large for 32-bit Python"
         )
-        # Emergency: try saving in two halves
+        # Emergency: try saving in two halves (re-joined into run_folder)
         try:
             mid = len(events) // 2
             save_numpy_format(filename.replace(".npy", "_A.npy"), events[:mid])
@@ -1407,12 +1579,13 @@ def update_stats():
     nc_cnt = sum(len(neutron_data[ch]) for ch in ADC_NEUTRON["channels"])
     tc_cnt = sum(len(tdc_data[ch]) for ch in TDC_MAIN["channels"]) if ENABLE_TDC else 0
     tdc_str = f" | TDC: {tc_cnt}" if ENABLE_TDC else " | TDC: OFF"
+    folder_str = f" | dir: {run_folder}" if run_folder else ""
     info_label.config(
         text=(
             f"Triggers: {trigger_count} ({trig_rate:.1f}/s) | "
             f"Hits: {event_count} ({hit_rate:.1f}/s) | "
             f"Gamma: {gc_cnt} | Neutron: {nc_cnt}{tdc_str} | "
-            f"Save buf: {len(events_to_save)}"
+            f"Save buf: {len(events_to_save)}{folder_str}"
         ),
         fg="blue",
     )
@@ -1487,6 +1660,21 @@ def on_toggle_display():
         draw_all()
 
 
+def on_listmode_toggle():
+    """Toggle list vs polled acquisition. Only allowed between runs."""
+    global ENABLE_LIST_MODE
+    if running:
+        # Can't switch mid-run — revert the checkbox to the active mode.
+        listmode_var.set(ENABLE_LIST_MODE)
+        print("[GUI] Cannot change acquisition mode while a run is active.")
+        return
+    ENABLE_LIST_MODE = bool(listmode_var.get())
+    print(
+        f"[GUI] Acquisition mode: "
+        f"{'LIST (fast)' if ENABLE_LIST_MODE else 'POLLED (slower, stabler)'}"
+    )
+
+
 def on_gamma_channel_change(event=None):
     global current_gamma_channel
     try:
@@ -1534,13 +1722,26 @@ def on_start():
         events_to_save
     global _dt_log_file, _last_dt_log_time
     global scaler_count_total, scaler_count_last
+    global run_folder, ENABLE_LIST_MODE
     if running:
         return
+
+    # Apply the acquisition mode chosen in the GUI BEFORE opening hardware
+    # (open_ccusb / acquisition_thread_func both read ENABLE_LIST_MODE).
+    if listmode_var is not None:
+        ENABLE_LIST_MODE = bool(listmode_var.get())
+
     try:
         open_ccusb()
     except Exception as e:
         print(f"[ERROR] {e}")
         return
+
+    # Hardware came up OK → create a fresh, auto-numbered output folder.
+    base = run_name_entry.get() if run_name_entry is not None else DEFAULT_RUN_NAME
+    run_folder = make_run_folder(base)
+    print(f"[RUN] Output folder: {os.path.abspath(run_folder)}")
+
     for ch in range(16):
         gamma_data[ch].clear()
         neutron_data[ch].clear()
@@ -1558,8 +1759,11 @@ def on_start():
     scaler_count_total = scaler_count_last = 0
     readout_times.clear()
     t0 = time.time()
+
+    write_run_info(run_folder)
+
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    dt_log_path = f"deadtime_{ts}.csv"
+    dt_log_path = os.path.join(run_folder, f"deadtime_{ts}.csv")
     try:
         _dt_log_file = open(dt_log_path, "w")
         _dt_log_file.write(
@@ -1570,6 +1774,13 @@ def on_start():
     except Exception as e:
         print(f"[DT-LOG] Could not open: {e}")
         _dt_log_file = None
+
+    # Lock the config controls for the duration of the run.
+    if listmode_check is not None:
+        listmode_check.config(state=tk.DISABLED)
+    if run_name_entry is not None:
+        run_name_entry.config(state=tk.DISABLED)
+
     running = True
     acquisition_thread = threading.Thread(target=acquisition_thread_func, daemon=True)
     acquisition_thread.start()
@@ -1586,8 +1797,6 @@ def on_stop():
     # Do this before join() so we don't wait 200ms for the timeout.
     if ENABLE_LIST_MODE and dll and hdev:
         try:
-            import struct
-
             # CRITICAL: [5, 0, 0] = Action Register = 0 (stop)
             pkt = struct.pack("<3H", 5, 0, 0)
             dll.xxusb_bulk_write(hdev, pkt, len(pkt), 500)
@@ -1615,6 +1824,12 @@ def on_stop():
             pass
         _dt_log_file = None
 
+    # Re-enable config controls for the next run.
+    if listmode_check is not None:
+        listmode_check.config(state=tk.NORMAL)
+    if run_name_entry is not None:
+        run_name_entry.config(state=tk.NORMAL)
+
 
 def on_close():
     global running, _dt_log_file
@@ -1622,8 +1837,6 @@ def on_close():
         running = False
         if ENABLE_LIST_MODE and dll and hdev:
             try:
-                import struct
-
                 # CRITICAL: [5, 0, 0] = Action Register = 0 (stop)
                 pkt = struct.pack("<3H", 5, 0, 0)
                 dll.xxusb_bulk_write(hdev, pkt, len(pkt), 500)
@@ -1631,6 +1844,14 @@ def on_close():
                 pass
         if acquisition_thread and acquisition_thread.is_alive():
             acquisition_thread.join(timeout=3.0)
+        # Flush whatever is still buffered so closing mid-run never loses data.
+        try:
+            process_event_queue()
+            if events_to_save:
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                save_numpy_format(f"run_{ts}_onclose.npy", events_to_save)
+        except Exception as e:
+            print(f"[CLOSE] final save failed: {e}")
     if _dt_log_file:
         try:
             _dt_log_file.close()
@@ -1657,6 +1878,7 @@ def main():
     global root, gamma_canvas, neutron_canvas_grid, tdc_canvas, info_label
     global deadtime_label, scaler_label, toggle_display_btn, clear_display_btn
     global gamma_channel_selector, tdc_channel_selector
+    global run_name_entry, listmode_check, listmode_var
 
     signal.signal(signal.SIGINT, signal_handler)
 
@@ -1675,6 +1897,34 @@ def main():
         font=("Arial", 9, "bold"),
         pady=3,
     ).pack(fill=tk.X)
+
+    # ---- Run configuration row: folder name + acquisition mode ----
+    run_cfg_frame = tk.Frame(root, bg="#e8e8e8")
+    run_cfg_frame.pack(fill=tk.X, pady=2)
+
+    tk.Label(run_cfg_frame, text="Run name:", bg="#e8e8e8").pack(
+        side=tk.LEFT, padx=(6, 2)
+    )
+    run_name_entry = tk.Entry(run_cfg_frame, width=18)
+    run_name_entry.insert(0, DEFAULT_RUN_NAME)
+    run_name_entry.pack(side=tk.LEFT, padx=2)
+    tk.Label(
+        run_cfg_frame,
+        text="→ folder per run (cobalt, cobalt_2, cobalt_3 …)",
+        bg="#e8e8e8",
+        fg="gray",
+        font=("Arial", 8),
+    ).pack(side=tk.LEFT, padx=4)
+
+    listmode_var = tk.BooleanVar(value=ENABLE_LIST_MODE)
+    listmode_check = tk.Checkbutton(
+        run_cfg_frame,
+        text="List mode (fast)  ·  unchecked = polled (slower, stabler)",
+        variable=listmode_var,
+        bg="#e8e8e8",
+        command=on_listmode_toggle,
+    )
+    listmode_check.pack(side=tk.LEFT, padx=12)
 
     display_frame = tk.Frame(root, bg="black")
     display_frame.pack(fill=tk.BOTH, expand=True)
